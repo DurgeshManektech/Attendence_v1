@@ -46,6 +46,11 @@ const el = {
 let lastFetchedWorkedMinutes = 0;
 let lastFetchedRemainingMinutes = 0;
 let lastFetchTimestamp = null;
+// Only tick the clock while actually clocked in — on a break, after leaving,
+// or before the first punch, worked/remaining time must stay frozen.
+let lastIsCurrentlyIn = false;
+// Same snapshot the background worker uses, so popup + badge always agree.
+let lastBadgeSnapshot = null;
 
 // Tracks calendar navigation state — the month the calendar currently
 // shows, the member whose records to fetch, and the most recent full
@@ -223,6 +228,10 @@ function render(data) {
   lastFetchedWorkedMinutes = workedMinutesSoFar;
   lastFetchedRemainingMinutes = remainingMinutes;
   lastFetchTimestamp = Date.now();
+  lastIsCurrentlyIn = !!data.isCurrentlyIn;
+  lastBadgeSnapshot = MTApi.makeBadgeSnapshot(data);
+  MTApi.saveBadgeSnapshot(lastBadgeSnapshot);
+  MTApi.renderBadgeFromSnapshot(lastBadgeSnapshot);
   el.workedValue.textContent = formatWorkedWithSeconds(workedMinutesSoFar);
   el.heroSub.textContent = `of ${MTApi.formatMinutesAsHM(shiftMinutes)} shift`;
 
@@ -321,12 +330,17 @@ async function load() {
 function tickDisplay() {
   if (!lastFetchTimestamp || el.mainContent.classList.contains("hidden"))
     return;
-  const elapsedMinutesSinceFetch = (Date.now() - lastFetchTimestamp) / 60000;
+  const elapsedMinutesSinceFetch = lastIsCurrentlyIn
+    ? (Date.now() - lastFetchTimestamp) / 60000
+    : 0;
   const liveWorkedMinutes = lastFetchedWorkedMinutes + elapsedMinutesSinceFetch;
   el.workedValue.textContent = formatWorkedWithSeconds(liveWorkedMinutes);
 
   const liveRemainingMinutes = lastFetchedRemainingMinutes - elapsedMinutesSinceFetch;
   el.remainingTimeLabel.textContent = formatWorkedWithSeconds(liveRemainingMinutes);
+
+  // Keep the toolbar badge in lockstep with the popup while it's open.
+  if (lastBadgeSnapshot) MTApi.renderBadgeFromSnapshot(lastBadgeSnapshot);
 }
 
 /** Moves the calendar to the previous/next month and fetches that month's
@@ -372,5 +386,5 @@ el.retryBtn.addEventListener("click", load);
 
 load();
 
-setInterval(load, 5 * 60 * 1000); // real re-fetch every 60s
+setInterval(load, 5 * 60 * 1000); // real re-fetch every 5 min
 setInterval(tickDisplay, 1000); // smooth per-second UI tick between fetches

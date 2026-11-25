@@ -490,8 +490,75 @@ async function fetchDashboardData(memberId) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Toolbar badge — shared by popup.js and background.js so both always show
+// the same number. The last fetch is saved as a small "snapshot"; the live
+// remaining time is derived from it on demand, so the badge can count down
+// every minute without hitting the server each time.
+// ---------------------------------------------------------------------------
+
+const BADGE_SNAPSHOT_KEY = "inout_badge_snapshot";
+
+function makeBadgeSnapshot(data) {
+  return {
+    remainingMinutes: data.remainingMinutes,
+    isCurrentlyIn: !!data.isCurrentlyIn,
+    fetchedAt: Date.now(),
+  };
+}
+
+/** Remaining shift minutes right now. Only counts down while clocked in. */
+function liveRemainingMinutes(snapshot, now = Date.now()) {
+  if (!snapshot) return null;
+  const elapsed = snapshot.isCurrentlyIn ? (now - snapshot.fetchedAt) / 60000 : 0;
+  return snapshot.remainingMinutes - elapsed;
+}
+
+/** Sets the toolbar badge from a snapshot. Floors minutes so it matches the
+ *  HH:MM part of the popup's HH:MM:SS countdown. */
+function renderBadgeFromSnapshot(snapshot) {
+  const remaining = liveRemainingMinutes(snapshot);
+  if (remaining === null) {
+    chrome.action.setBadgeText({ text: "" });
+    return;
+  }
+  const targetReached = remaining <= 0;
+  const wholeMinutes = Math.max(0, Math.floor(remaining));
+  const hours = Math.floor(wholeMinutes / 60);
+  const mins = wholeMinutes % 60;
+  // Chrome badges only reliably show ~4 characters.
+  const label = hours >= 10 ? `${hours}h` : `${hours}:${pad2(mins)}`;
+
+  chrome.action.setBadgeText({ text: targetReached ? "✓" : label });
+  chrome.action.setBadgeBackgroundColor({
+    color: targetReached ? "#5ee6c4" : "#e7e8e9",
+  });
+  if (chrome.action.setBadgeTextColor) {
+    chrome.action.setBadgeTextColor({ color: "#0a1512" });
+  }
+}
+
+async function saveBadgeSnapshot(snapshot) {
+  await chrome.storage.local.set({ [BADGE_SNAPSHOT_KEY]: snapshot });
+}
+
+async function loadBadgeSnapshot() {
+  const stored = await chrome.storage.local.get(BADGE_SNAPSHOT_KEY);
+  return stored[BADGE_SNAPSHOT_KEY] || null;
+}
+
+async function clearBadgeSnapshot() {
+  await chrome.storage.local.remove(BADGE_SNAPSHOT_KEY);
+}
+
 // Exposed for popup.js / background.js (classic script, no ES modules in MV3 popup by default)
 self.MTApi = {
+  makeBadgeSnapshot,
+  liveRemainingMinutes,
+  renderBadgeFromSnapshot,
+  saveBadgeSnapshot,
+  loadBadgeSnapshot,
+  clearBadgeSnapshot,
   BASE_URL,
   todayISO,
   formatMinutesAsHM,
