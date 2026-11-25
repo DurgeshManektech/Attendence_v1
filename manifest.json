@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "InOut Tracker — MTWorks",
+  "version": "1.0.0",
+  "description": "See your today's in-time, worked hours, expected out-time, and monthly attendance stats from MTWorks — without opening the portal.",
+  "permissions": ["storage", "alarms"],
+  "host_permissions": [
+    "http://mtworks.manektech.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "InOut Tracker",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_page": "options.html",
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
