@@ -490,80 +490,58 @@ async function fetchDashboardData(memberId) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Toolbar badge — shared by popup.js and background.js so both always show
-// the same number. The last fetch is saved as a small "snapshot"; the live
-// remaining time is derived from it on demand, so the badge can count down
-// every minute without hitting the server each time.
-// ---------------------------------------------------------------------------
+/**
+ * Lightweight fetch for the toolbar badge only: just enough to compute
+ * remaining-time-in-shift. Deliberately skips MemberSelect (auth gate /
+ * department / shift-time text — irrelevant to the badge's number) and
+ * InOutSelectByMonth (month stats — only the popup's stat cards use
+ * those). Those two cost nothing when the popup is actually open and
+ * wants the full picture, but there's no reason to pay for them every
+ * single minute just to refresh a badge that only ever shows one number.
+ */
+async function fetchBadgeData(memberId) {
+  const todayPunches = await getTodayPunches(memberId);
 
-const BADGE_SNAPSHOT_KEY = "inout_badge_snapshot";
+  const WORK_SHIFT_MINUTES = 495; // 8:15 actual working time — excludes unpaid break
+  const shiftMinutes = WORK_SHIFT_MINUTES;
+  // No punches yet today (not clocked in, day off, etc.) is a normal
+  // state, not an error — getTodayPunches returns null for it.
+  const workedMinutesSoFar = todayPunches ? todayPunches.totalWorkedMinutes : 0;
+  const remainingMinutes = shiftMinutes - workedMinutesSoFar;
+  const targetReached = remainingMinutes <= 0;
 
-function makeBadgeSnapshot(data) {
+  return { shiftMinutes, workedMinutesSoFar, remainingMinutes, targetReached };
+}
+
+/**
+ * Shared badge text/color formatting — used by both background.js (its
+ * own periodic refresh) and popup.js (so the badge updates the instant
+ * the popup fetches fresh data too, instead of the two drifting apart on
+ * separate fetch cycles). Badge shows time REMAINING in the shift.
+ */
+function computeBadge(data) {
+  const remainingMinutes = Math.max(0, Math.round(data.remainingMinutes));
+  const hours = Math.floor(remainingMinutes / 60);
+  const mins = remainingMinutes % 60;
+  // Chrome badges only reliably show ~4 characters — cap hours so the
+  // label never gets silently clipped (e.g. "12:34" -> just show "12h").
+  const label = hours >= 10 ? `${hours}h` : `${hours}:${mins.toString().padStart(2, "0")}`;
+
   return {
-    remainingMinutes: data.remainingMinutes,
-    isCurrentlyIn: !!data.isCurrentlyIn,
-    fetchedAt: Date.now(),
+    text: data.targetReached ? "✓" : label,
+    color: data.targetReached ? "#5ee6c4" : "#e7e8e9",
   };
-}
-
-/** Remaining shift minutes right now. Only counts down while clocked in. */
-function liveRemainingMinutes(snapshot, now = Date.now()) {
-  if (!snapshot) return null;
-  const elapsed = snapshot.isCurrentlyIn ? (now - snapshot.fetchedAt) / 60000 : 0;
-  return snapshot.remainingMinutes - elapsed;
-}
-
-/** Sets the toolbar badge from a snapshot. Floors minutes so it matches the
- *  HH:MM part of the popup's HH:MM:SS countdown. */
-function renderBadgeFromSnapshot(snapshot) {
-  const remaining = liveRemainingMinutes(snapshot);
-  if (remaining === null) {
-    chrome.action.setBadgeText({ text: "" });
-    return;
-  }
-  const targetReached = remaining <= 0;
-  const wholeMinutes = Math.max(0, Math.floor(remaining));
-  const hours = Math.floor(wholeMinutes / 60);
-  const mins = wholeMinutes % 60;
-  // Chrome badges only reliably show ~4 characters.
-  const label = hours >= 10 ? `${hours}h` : `${hours}:${pad2(mins)}`;
-
-  chrome.action.setBadgeText({ text: targetReached ? "✓" : label });
-  chrome.action.setBadgeBackgroundColor({
-    color: targetReached ? "#5ee6c4" : "#e7e8e9",
-  });
-  if (chrome.action.setBadgeTextColor) {
-    chrome.action.setBadgeTextColor({ color: "#0a1512" });
-  }
-}
-
-async function saveBadgeSnapshot(snapshot) {
-  await chrome.storage.local.set({ [BADGE_SNAPSHOT_KEY]: snapshot });
-}
-
-async function loadBadgeSnapshot() {
-  const stored = await chrome.storage.local.get(BADGE_SNAPSHOT_KEY);
-  return stored[BADGE_SNAPSHOT_KEY] || null;
-}
-
-async function clearBadgeSnapshot() {
-  await chrome.storage.local.remove(BADGE_SNAPSHOT_KEY);
 }
 
 // Exposed for popup.js / background.js (classic script, no ES modules in MV3 popup by default)
 self.MTApi = {
-  makeBadgeSnapshot,
-  liveRemainingMinutes,
-  renderBadgeFromSnapshot,
-  saveBadgeSnapshot,
-  loadBadgeSnapshot,
-  clearBadgeSnapshot,
   BASE_URL,
   todayISO,
   formatMinutesAsHM,
   fetchDashboardData,
+  fetchBadgeData,
   detectLoggedInMemberId,
   checkSession,
   getMonthRecords,
+  computeBadge,
 };
