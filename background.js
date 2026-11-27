@@ -3,15 +3,11 @@
 
 importScripts('api.js');
 
-const MEMBER_ID_OVERRIDE_KEY = 'mtworks_member_id_override';
 const ALARM_NAME = 'inout-badge-refresh';
 
-async function getMemberId() {
-  const stored = await chrome.storage.local.get(MEMBER_ID_OVERRIDE_KEY);
-  const override = stored[MEMBER_ID_OVERRIDE_KEY];
-  if (override) return override;
-
-  return self.MTApi.detectLoggedInMemberId(); // throws if not logged in
+// Override → cached ID → detect (slow, full page fetch) — see api.js.
+function getMemberId() {
+  return self.MTApi.resolveMemberId();
 }
 
 async function refreshBadge(trigger) {
@@ -30,6 +26,11 @@ async function refreshBadge(trigger) {
     // logged (rather than swallowed) so the service worker console shows
     // *why*, instead of looking like the alarm never fired at all.
     console.warn(`[bg] refreshBadge failed (${trigger}):`, err);
+    // Anything other than a plain network failure may mean the cached member
+    // ID is stale (logged out / different user) — re-detect next time.
+    if (!String(err && err.message).startsWith('NETWORK_ERROR')) {
+      self.MTApi.clearCachedMemberId();
+    }
     chrome.action.setBadgeText({ text: '' });
   }
 }

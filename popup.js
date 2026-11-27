@@ -1,7 +1,5 @@
 // popup.js — wires MTApi data into the popup UI.
 
-const MEMBER_ID_STORAGE_KEY = "mtworks_member_id";
-
 const el = {
   statusDot: document.getElementById("statusDot"),
   refreshBtn: document.getElementById("refreshBtn"),
@@ -14,47 +12,52 @@ const el = {
   retryBtn: document.getElementById("retryBtn"),
   mainContent: document.getElementById("mainContent"),
 
-  heroLabel: document.getElementById("heroLabel"),
-  targetBadge: document.getElementById("targetBadge"),
+  // Hero
+  ringFill: document.getElementById("ringFill"),
   workedValue: document.getElementById("workedValue"),
-  heroSub: document.getElementById("heroSub"),
-
-  inTimeLabel: document.getElementById("inTimeLabel"),
+  workedSec: document.getElementById("workedSec"),
+  targetBadge: document.getElementById("targetBadge"),
+  heroLabel: document.getElementById("heroLabel"),
   outTimeLabel: document.getElementById("outTimeLabel"),
   remainingTimeLabel: document.getElementById("remainingTimeLabel"),
-  timelineFill: document.getElementById("timelineFill"),
-  timelineNow: document.getElementById("timelineNow"),
+  inTimeCaption: document.getElementById("inTimeCaption"),
+  inTimeLabel: document.getElementById("inTimeLabel"),
+  shiftLenValue: document.getElementById("shiftLenValue"),
 
+  // Month stats
+  attendanceValue: document.getElementById("attendanceValue"),
+  presentDaysValue: document.getElementById("presentDaysValue"),
+  workingDaysValue: document.getElementById("workingDaysValue"),
+  lateDaysValue: document.getElementById("lateDaysValue"),
+
+  // Calendar
   calMonthLabel: document.getElementById("calMonthLabel"),
   calGrid: document.getElementById("calGrid"),
   calPrevBtn: document.getElementById("calPrevBtn"),
   calNextBtn: document.getElementById("calNextBtn"),
 
-  shiftLenValue: document.getElementById("shiftLenValue"),
-  attendanceValue: document.getElementById("attendanceValue"),
-  presentDaysValue: document.getElementById("presentDaysValue"),
-  workingDaysValue: document.getElementById("workingDaysValue"),
-  lateDaysValue: document.getElementById("lateDaysValue"),
-  otValue: document.getElementById("otValue"), // optional — only if added to popup.html
-
   lastUpdated: document.getElementById("lastUpdated"),
   deptLabel: document.getElementById("deptLabel"),
 };
 
-// Tracks the most recent fetch so the hero number (and remaining-time
-// stat) can tick live in between re-fetches, down to the second.
+const RING_CIRCUMFERENCE = 2 * Math.PI * 52; // matches r="52" in popup.html
+
+// Baseline from the most recent fetch, so the hero can tick every second
+// in between re-fetches.
 let lastFetchedWorkedMinutes = 0;
 let lastFetchedRemainingMinutes = 0;
+let lastFetchedShiftMinutes = 0;
 let lastFetchTimestamp = null;
+// Time only moves while actually clocked in — on a break, after leaving,
+// or before the first punch, worked/remaining must stay frozen.
+let lastIsCurrentlyIn = false;
 
-// Tracks calendar navigation state — the month the calendar currently
-// shows, the member whose records to fetch, and the most recent full
-// dashboard fetch (for "today" context when the shown month is the
-// real current month).
+// Calendar navigation state.
 let currentCalendarDate = new Date();
 let currentMemberId = null;
 let lastDashboardData = null;
 let calendarNavBusy = false;
+let loadBusy = false;
 
 function showState(name) {
   el.loadingState.classList.toggle("hidden", name !== "loading");
@@ -72,46 +75,80 @@ function formatClock(date) {
   return `${h}:${m.toString().padStart(2, "0")} ${ampm}`;
 }
 
-/** Formats a total-minutes value as HH:MM:SS, treating the value as a live
- *  starting point and adding whole seconds elapsed since it was fetched. */
-function formatWorkedWithSeconds(totalMinutes) {
-  const totalSeconds = Math.max(0, Math.round(totalMinutes * 60));
-  const h = Math.floor(totalSeconds / 3600);
-  const m = Math.floor((totalSeconds % 3600) / 60);
-  const s = totalSeconds % 60;
-  return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+// pad2() comes from api.js — both scripts share one global scope, so
+// re-declaring it here would be a SyntaxError that stops popup.js loading.
+
+/** Splits minutes into whole h / m / s (never negative). */
+function splitMinutes(totalMinutes) {
+  const totalSeconds = Math.max(0, Math.floor(totalMinutes * 60));
+  return {
+    h: Math.floor(totalSeconds / 3600),
+    m: Math.floor((totalSeconds % 3600) / 60),
+    s: totalSeconds % 60,
+  };
 }
 
-const MEMBER_ID_OVERRIDE_KEY = "mtworks_member_id_override";
+/** "8h 15m" — for durations shown as plain text. */
+function formatDuration(totalMinutes) {
+  const { h, m } = splitMinutes(totalMinutes);
+  if (h && m) return `${h}h ${m}m`;
+  if (h) return `${h}h`;
+  return `${m}m`;
+}
 
-/**
- * Resolves which member ID to fetch data for.
- *
- * Priority:
- *   1. An explicit manual override (set via the Options page) — for the
- *      rare case someone deliberately wants to view a different person's
- *      data (e.g. a PM checking a report they manage).
- *   2. Auto-detected from the logged-in session itself (reads the hidden
- *      field the server renders per-session on inout-summary.aspx).
- *
- * There is NO hardcoded fallback member ID anymore — that was the bug
- * that made every install show one specific person's data regardless of
- * who was actually logged in.
- */
-async function getMemberId() {
-  const stored = await chrome.storage.local.get(MEMBER_ID_OVERRIDE_KEY);
-  const override = stored[MEMBER_ID_OVERRIDE_KEY];
-  if (override) return override;
+/** "2h 05m 10s" / "5m 45s" — for the live countdown. */
+function formatCountdown(totalMinutes) {
+  const { h, m, s } = splitMinutes(totalMinutes);
+  return h ? `${h}h ${pad2(m)}m ${pad2(s)}s` : `${m}m ${pad2(s)}s`;
+}
 
-  return MTApi.detectLoggedInMemberId(); // throws if detection fails — caller must handle
+/** Override → cached ID → detect (slow, full page fetch) — see api.js. */
+function getMemberId() {
+  return MTApi.resolveMemberId(); // throws if detection fails — caller must handle
+}
+
+// Last successful dashboard fetch, saved so the next popup open can show it
+// instantly while fresh data loads in the background.
+const DASHBOARD_CACHE_KEY = "inout_last_dashboard";
+
+async function saveDashboardCache(data) {
+  try {
+    await chrome.storage.local.set({ [DASHBOARD_CACHE_KEY]: JSON.stringify(data) });
+  } catch (err) {
+    console.warn("[popup] couldn't cache dashboard:", err);
+  }
+}
+
+/** Returns today's cached dashboard (with Dates restored), or null. Data
+ *  from a previous day is ignored — it would show yesterday's hours. */
+async function loadDashboardCache() {
+  try {
+    const stored = await chrome.storage.local.get(DASHBOARD_CACHE_KEY);
+    if (!stored[DASHBOARD_CACHE_KEY]) return null;
+    const data = JSON.parse(stored[DASHBOARD_CACHE_KEY]);
+    const toDate = (v) => (v ? new Date(v) : null);
+    data.fetchedAt = toDate(data.fetchedAt);
+    data.inTimeDate = toDate(data.inTimeDate);
+    data.expectedOutDate = toDate(data.expectedOutDate);
+    if (!data.fetchedAt || data.fetchedAt.toDateString() !== new Date().toDateString()) return null;
+    return data;
+  } catch {
+    return null;
+  }
 }
 
 /** Renders a compact month calendar, color-coded like the MTWorks portal's
- *  own calendar (present/off/holiday/leave/absent), from the raw per-day
- *  records returned alongside the month summary. */
-function renderCalendar(data) {
+ *  own calendar (present/off/holiday/leave/absent). `direction` (-1 / 1)
+ *  slides the grid in from the side you navigated toward. */
+function renderCalendar(data, direction = 0) {
   const { monthRecords, shiftMinutes, workedMinutesSoFar, remainingMinutes, targetReached, monthDate } = data;
   el.calGrid.innerHTML = "";
+
+  el.calGrid.classList.remove("slide-next", "slide-prev");
+  if (direction) {
+    void el.calGrid.offsetWidth; // restart the animation
+    el.calGrid.classList.add(direction > 0 ? "slide-next" : "slide-prev");
+  }
 
   const labelDate = monthDate || new Date();
   el.calMonthLabel.textContent = labelDate.toLocaleDateString("en-US", {
@@ -207,76 +244,115 @@ function renderCalendar(data) {
   }
 }
 
-function render(data) {
-  const {
-    shiftMinutes,
-    workedMinutesSoFar,
-    remainingMinutes,
-    targetReached,
-    inTimeDate,
-    expectedOutDate,
-    monthSummary,
-    memberInfo,
-  } = data;
+/** Live worked/remaining minutes right now, based on the last fetch. */
+function liveMinutes() {
+  const elapsed =
+    lastIsCurrentlyIn && lastFetchTimestamp ? (Date.now() - lastFetchTimestamp) / 60000 : 0;
+  return {
+    worked: lastFetchedWorkedMinutes + elapsed,
+    remaining: lastFetchedRemainingMinutes - elapsed,
+  };
+}
 
-  // Hero — set the live-tick baseline from this fresh fetch.
+/** Updates the parts of the hero that change every second. */
+function renderLive() {
+  const { worked, remaining } = liveMinutes();
+
+  const w = splitMinutes(worked);
+  el.workedValue.textContent = `${w.h}:${pad2(w.m)}`;
+  el.workedSec.textContent = `:${pad2(w.s)}`;
+
+  const pct = lastFetchedShiftMinutes > 0 ? Math.min(worked / lastFetchedShiftMinutes, 1) : 0;
+  el.ringFill.style.strokeDashoffset = `${RING_CIRCUMFERENCE * (1 - pct)}`;
+
+  if (remaining <= 0) {
+    el.remainingTimeLabel.textContent =
+      remaining < -1 ? `+${formatDuration(-remaining)} extra today` : "Shift complete";
+  } else if (worked <= 0 && !lastIsCurrentlyIn) {
+    el.remainingTimeLabel.textContent = "Not clocked in yet";
+  } else {
+    el.remainingTimeLabel.textContent = `${formatCountdown(remaining)} left`;
+  }
+  el.remainingTimeLabel.classList.toggle("muted", worked <= 0 && !lastIsCurrentlyIn);
+}
+
+/** Sets the status pill, ring colour, status dot and labels for the
+ *  current state: working / on break / done / not clocked in. */
+function renderStatus(remainingMinutes, workedMinutes) {
+  const done = remainingMinutes <= 0;
+  const notStarted = workedMinutes <= 0 && !lastIsCurrentlyIn;
+  const onBreak = !done && !notStarted && !lastIsCurrentlyIn;
+
+  let pill = { text: "Working", cls: "working" };
+  if (done) pill = { text: "Shift complete", cls: "done" };
+  else if (notStarted) pill = { text: "Not clocked in", cls: "" };
+  else if (onBreak) pill = { text: "On break", cls: "break" };
+
+  el.targetBadge.textContent = pill.text;
+  el.targetBadge.className = `pill ${pill.cls}`;
+
+  el.ringFill.classList.toggle("done", done);
+  el.ringFill.classList.toggle("paused", onBreak);
+
+  el.statusDot.classList.remove("live", "idle");
+  if (lastIsCurrentlyIn) el.statusDot.classList.add("live");
+  else if (onBreak) el.statusDot.classList.add("idle");
+
+  el.heroLabel.textContent = done ? "You could leave at" : notStarted ? "Expected out" : "Leave at";
+  el.inTimeCaption.textContent = notStarted ? "Starts" : "In";
+}
+
+function render(data, { keepCalendarMonth = false } = {}) {
+  const { shiftMinutes, workedMinutesSoFar, remainingMinutes, inTimeDate, expectedOutDate, monthSummary, memberInfo } =
+    data;
+
+  // Live-tick baseline from this fresh fetch.
   lastFetchedWorkedMinutes = workedMinutesSoFar;
   lastFetchedRemainingMinutes = remainingMinutes;
-  lastFetchTimestamp = Date.now();
-  el.workedValue.textContent = formatWorkedWithSeconds(workedMinutesSoFar);
-  el.heroSub.textContent = `of ${MTApi.formatMinutesAsHM(shiftMinutes)} shift`;
+  lastFetchedShiftMinutes = shiftMinutes;
+  // Use the real fetch time, so data shown from the cache ticks forward correctly.
+  const fetchedAt = data.fetchedAt instanceof Date ? data.fetchedAt : new Date();
+  lastFetchTimestamp = fetchedAt.getTime();
+  lastIsCurrentlyIn = data.isCurrentlyIn === true;
 
-  el.statusDot.classList.remove("live", "warn");
-  if (targetReached) {
-    el.heroLabel.textContent = "Shift complete";
-    el.targetBadge.textContent =
-      remainingMinutes < -1
-        ? `+${MTApi.formatMinutesAsHM(-remainingMinutes)} extra`
-        : "Target reached";
-    el.targetBadge.className = "badge reached";
-    el.statusDot.classList.add("live");
-  } else {
-    el.heroLabel.textContent = "Worked so far";
-    el.targetBadge.textContent = "In progress";
-    el.targetBadge.className = "badge on-track";
-    el.statusDot.classList.add("live");
-  }
-
-  // In / Remaining / Expected out row
-  el.inTimeLabel.textContent = formatClock(inTimeDate);
+  renderStatus(remainingMinutes, workedMinutesSoFar);
   el.outTimeLabel.textContent = formatClock(expectedOutDate);
-  el.remainingTimeLabel.textContent =
-    remainingMinutes > 0 ? formatWorkedWithSeconds(remainingMinutes) : "00:00:00";
+  el.inTimeLabel.textContent = formatClock(inTimeDate);
+  el.shiftLenValue.textContent = formatDuration(shiftMinutes);
 
-  let pct = shiftMinutes > 0 ? (workedMinutesSoFar / shiftMinutes) * 100 : 0;
-  const over = pct > 100;
-  pct = Math.max(0, Math.min(pct, 100));
-  el.timelineFill.style.width = `${pct}%`;
-  el.timelineFill.classList.toggle("over", over);
-  el.timelineNow.style.left = `${pct}%`;
-
-  // Stats
-  el.shiftLenValue.textContent = MTApi.formatMinutesAsHM(shiftMinutes);
+  // Month stats
   el.attendanceValue.textContent = `${monthSummary.attendancePct}%`;
   el.presentDaysValue.textContent = monthSummary.presentDays;
   el.workingDaysValue.textContent = monthSummary.workingDays;
   el.lateDaysValue.textContent = monthSummary.lateDays;
-  if (el.otValue) el.otValue.textContent = monthSummary.OT;
 
   el.deptLabel.textContent = memberInfo.department || "";
-  el.lastUpdated.textContent = `Updated ${formatClock(new Date())}`;
+  el.lastUpdated.textContent = `Updated ${formatClock(fetchedAt)}`;
 
-  // A full refresh always returns the calendar to the current month.
-  currentCalendarDate = new Date();
-  renderCalendar({ ...data, monthDate: currentCalendarDate });
+  // Background refreshes keep whatever month you were looking at; a manual
+  // refresh brings the calendar back to the current month.
+  const now = new Date();
+  const viewingCurrentMonth =
+    currentCalendarDate.getFullYear() === now.getFullYear() &&
+    currentCalendarDate.getMonth() === now.getMonth();
+  if (!keepCalendarMonth || viewingCurrentMonth) {
+    currentCalendarDate = now;
+    renderCalendar({ ...data, monthDate: currentCalendarDate });
+  }
 
-  showState("main");
+  const firstShow = el.mainContent.classList.contains("hidden");
+  if (firstShow) {
+    // Start the ring empty so it animates up to the real value.
+    el.ringFill.style.strokeDashoffset = `${RING_CIRCUMFERENCE}`;
+    showState("main");
+    requestAnimationFrame(() => requestAnimationFrame(renderLive));
+  } else {
+    renderLive();
+  }
 }
 
 /** Pushes the toolbar badge to match this fetch immediately, so it doesn't
- *  sit on whatever background.js's own (separate, up-to-a-minute-stale)
- *  refresh cycle last computed — the two were previously drifting apart
- *  because they ran as two independent fetches on two different timers. */
+ *  sit on whatever background.js's own refresh cycle last computed. */
 function syncBadge(data) {
   try {
     const badge = MTApi.computeBadge(data);
@@ -288,27 +364,49 @@ function syncBadge(data) {
   }
 }
 
-async function load() {
-  showState("loading");
+/** Resolves the member ID (cached when possible) and fetches the dashboard. */
+async function fetchForCurrentMember() {
+  let memberId;
+  try {
+    memberId = await getMemberId();
+  } catch (detectErr) {
+    console.error("[popup] member ID detection failed:", detectErr);
+    const authErr = new Error("AUTH_REQUIRED");
+    authErr.cause = detectErr && detectErr.message ? detectErr.message : String(detectErr);
+    throw authErr;
+  }
+  currentMemberId = memberId;
+  return MTApi.fetchDashboardData(memberId);
+}
+
+/** `silent` = background auto-refresh: keeps the current data on screen
+ *  (no loading spinner flash) and keeps the calendar on the month you're viewing. */
+async function load({ silent = false } = {}) {
+  if (loadBusy) return;
+  loadBusy = true;
+
+  const showingData = !el.mainContent.classList.contains("hidden");
+  if (!(silent && showingData)) showState("loading");
   el.refreshBtn.classList.add("spinning");
 
+  if (silent && showingData) el.lastUpdated.textContent = "Updating…";
+
   try {
-    let memberId;
+    let data;
     try {
-      memberId = await getMemberId();
-    } catch (detectErr) {
-      console.error("[popup] member ID detection failed:", detectErr);
-      const authErr = new Error("AUTH_REQUIRED");
-      authErr.cause =
-        detectErr && detectErr.message ? detectErr.message : String(detectErr);
-      throw authErr;
+      data = await fetchForCurrentMember();
+    } catch (err) {
+      if (!(err && err.message === "AUTH_REQUIRED")) throw err;
+      // The cached member ID may be stale (session expired, or a different
+      // person logged in). Forget it and try once more with a fresh detect.
+      await MTApi.clearCachedMemberId();
+      data = await fetchForCurrentMember();
     }
 
-    currentMemberId = memberId;
-    const data = await MTApi.fetchDashboardData(memberId);
     lastDashboardData = data;
-    render(data);
+    render(data, { keepCalendarMonth: silent });
     syncBadge(data);
+    saveDashboardCache(data);
   } catch (err) {
     console.error("[popup] load failed:", err);
     const detail =
@@ -319,40 +417,42 @@ async function load() {
           : "Unknown error";
 
     if (err && err.message === "AUTH_REQUIRED") {
-      el.authDetail.textContent = err.cause ? `Detail: ${err.cause}` : "";
+      chrome.storage.local.remove(DASHBOARD_CACHE_KEY);
+      el.authDetail.textContent = err.cause || "";
       showState("auth");
+    } else if (silent && showingData) {
+      // Keep showing the last good data rather than replacing it with an error.
+      el.lastUpdated.textContent = "Couldn't refresh";
     } else {
-      el.errorMsg.textContent =
-        "Check your connection or try again in a moment.";
-      el.errorDetail.textContent = `Detail: ${detail}`;
+      el.errorMsg.textContent = "Check your connection or try again in a moment.";
+      el.errorDetail.textContent = detail;
       showState("error");
     }
   } finally {
     el.refreshBtn.classList.remove("spinning");
+    loadBusy = false;
   }
 }
 
-/** Smoothly ticks the hero "worked so far" value every second between
- *  the real 60s re-fetches, so seconds visibly move instead of jumping. */
+/** Ticks the live parts of the hero every second between re-fetches. */
 function tickDisplay() {
-  if (!lastFetchTimestamp || el.mainContent.classList.contains("hidden"))
-    return;
-  const elapsedMinutesSinceFetch = (Date.now() - lastFetchTimestamp) / 60000;
-  const liveWorkedMinutes = lastFetchedWorkedMinutes + elapsedMinutesSinceFetch;
-  el.workedValue.textContent = formatWorkedWithSeconds(liveWorkedMinutes);
-
-  const liveRemainingMinutes = lastFetchedRemainingMinutes - elapsedMinutesSinceFetch;
-  el.remainingTimeLabel.textContent = formatWorkedWithSeconds(liveRemainingMinutes);
+  if (!lastFetchTimestamp || el.mainContent.classList.contains("hidden")) return;
+  renderLive();
+  // Flip the pill to "Shift complete" the moment the countdown hits zero.
+  const { worked, remaining } = liveMinutes();
+  if (remaining <= 0 && !el.targetBadge.classList.contains("done")) {
+    renderStatus(remaining, worked);
+  }
 }
 
 /** Moves the calendar to the previous/next month and fetches that month's
- *  records on demand — only the month actually being looked at is ever
- *  fetched, never the whole year up front. */
+ *  records on demand. */
 async function navigateMonth(delta) {
   if (calendarNavBusy || !currentMemberId) return;
   calendarNavBusy = true;
   el.calPrevBtn.disabled = true;
   el.calNextBtn.disabled = true;
+  el.calGrid.classList.add("loading");
 
   const targetDate = new Date(
     currentCalendarDate.getFullYear(),
@@ -363,17 +463,21 @@ async function navigateMonth(delta) {
   try {
     const monthRecords = await MTApi.getMonthRecords(currentMemberId, targetDate);
     currentCalendarDate = targetDate;
-    renderCalendar({
-      monthRecords,
-      shiftMinutes: lastDashboardData ? lastDashboardData.shiftMinutes : 0,
-      workedMinutesSoFar: lastDashboardData ? lastDashboardData.workedMinutesSoFar : 0,
-      remainingMinutes: lastDashboardData ? lastDashboardData.remainingMinutes : 0,
-      targetReached: lastDashboardData ? lastDashboardData.targetReached : false,
-      monthDate: targetDate,
-    });
+    renderCalendar(
+      {
+        monthRecords,
+        shiftMinutes: lastDashboardData ? lastDashboardData.shiftMinutes : 0,
+        workedMinutesSoFar: lastDashboardData ? lastDashboardData.workedMinutesSoFar : 0,
+        remainingMinutes: lastDashboardData ? lastDashboardData.remainingMinutes : 0,
+        targetReached: lastDashboardData ? lastDashboardData.targetReached : false,
+        monthDate: targetDate,
+      },
+      delta
+    );
   } catch (err) {
     console.error("[popup] month navigation failed:", err);
   } finally {
+    el.calGrid.classList.remove("loading");
     calendarNavBusy = false;
     el.calPrevBtn.disabled = false;
     el.calNextBtn.disabled = false;
@@ -383,10 +487,47 @@ async function navigateMonth(delta) {
 el.calPrevBtn.addEventListener("click", () => navigateMonth(-1));
 el.calNextBtn.addEventListener("click", () => navigateMonth(1));
 
-el.refreshBtn.addEventListener("click", load);
-el.retryBtn.addEventListener("click", load);
+el.refreshBtn.addEventListener("click", () => load());
 
-load();
+const themeBtn = document.getElementById("themeBtn");
+function updateThemeBtnTitle() {
+  themeBtn.title = InOutTheme.current() === "light" ? "Switch to dark theme" : "Switch to light theme";
+}
+themeBtn.addEventListener("click", () => {
+  InOutTheme.toggle();
+  updateThemeBtnTitle();
+});
+updateThemeBtnTitle();
+el.retryBtn.addEventListener("click", () => load());
 
-setInterval(load, 5 * 60 * 1000); // real re-fetch every 60s
-setInterval(tickDisplay, 1000); // smooth per-second UI tick between fetches
+// Open instantly: show today's last-known data straight from the cache
+// (no network), then refresh it quietly in the background.
+//
+// If that data is under a minute old (you just closed and reopened the
+// popup), don't hit the server at all. MTWorks handles one request at a time
+// per login session, so the previous popup's still-running requests would
+// make a new set queue up behind them — that's what made re-opens slow.
+const FRESH_ENOUGH_MS = 60 * 1000;
+
+(async () => {
+  const t0 = performance.now();
+  const cached = await loadDashboardCache();
+  if (cached && !lastDashboardData) {
+    lastDashboardData = cached;
+    render(cached);
+    console.info(`[popup] showed cached data in ${Math.round(performance.now() - t0)} ms`);
+  }
+
+  if (cached && Date.now() - cached.fetchedAt.getTime() < FRESH_ENOUGH_MS) {
+    console.info("[popup] cached data is fresh — skipping network refresh");
+    // We still need the member ID for calendar month navigation (cached, no network).
+    MTApi.resolveMemberId().then((id) => (currentMemberId = id), () => {});
+    return;
+  }
+
+  await load({ silent: !!cached });
+  console.info(`[popup] refresh finished in ${Math.round(performance.now() - t0)} ms`);
+})();
+
+setInterval(() => load({ silent: true }), 5 * 60 * 1000); // quiet re-fetch every 5 min
+setInterval(tickDisplay, 1000); // per-second UI tick between fetches

@@ -31,6 +31,7 @@ function daysInMonth(month, year) {
  * installs it, instead of always showing one hardcoded person's data.
  */
 async function detectLoggedInMemberId() {
+  const t0 = performance.now();
   let res;
   try {
     res = await fetch(`${BASE_URL}/inout-summary.aspx`, {
@@ -51,6 +52,7 @@ async function detectLoggedInMemberId() {
   }
 
   const html = await res.text();
+  logTiming("inout-summary.aspx (member ID detect)", t0, `${Math.round(html.length / 1024)} KB`);
 
   // Look for: id="content_hdnMemberId" ... value="6552"  (attribute order
   // can vary, so match value= either before or after the id=).
@@ -76,6 +78,39 @@ async function detectLoggedInMemberId() {
   }
 
   return match[1];
+}
+
+// ---------------------------------------------------------------------------
+// Member ID resolution with caching.
+//
+// Detecting the ID means downloading the whole inout-summary.aspx page, which
+// is by far the slowest request. The ID never changes for a logged-in user,
+// so detect it once and reuse it; re-detect after 12h or after an auth
+// failure (e.g. someone else logged in on this browser).
+// ---------------------------------------------------------------------------
+
+const MEMBER_ID_OVERRIDE_KEY = "mtworks_member_id_override";
+const MEMBER_ID_CACHE_KEY = "mtworks_detected_member_id";
+const MEMBER_ID_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+
+async function resolveMemberId() {
+  const stored = await chrome.storage.local.get([MEMBER_ID_OVERRIDE_KEY, MEMBER_ID_CACHE_KEY]);
+  if (stored[MEMBER_ID_OVERRIDE_KEY]) return stored[MEMBER_ID_OVERRIDE_KEY];
+
+  const cached = stored[MEMBER_ID_CACHE_KEY];
+  if (cached && cached.id && Date.now() - cached.at < MEMBER_ID_CACHE_TTL_MS) {
+    return cached.id;
+  }
+
+  const id = await detectLoggedInMemberId(); // throws if not logged in
+  await chrome.storage.local.set({ [MEMBER_ID_CACHE_KEY]: { id, at: Date.now() } });
+  return id;
+}
+
+/** Forget the cached ID — call when the server rejects the session, so the
+ *  next attempt re-detects who is logged in. */
+async function clearCachedMemberId() {
+  await chrome.storage.local.remove(MEMBER_ID_CACHE_KEY);
 }
 
 /** Formats a Date as "Jul 29 2026" — the format InOutSelectByDateAsc expects. */
@@ -104,7 +139,15 @@ function parsePunchDateTime(str) {
   return isNaN(d.getTime()) ? null : d;
 }
 
+/** Logs how long a request took — open the popup, right-click → Inspect →
+ *  Console to see these. Helps spot which MTWorks call is slow. */
+function logTiming(label, t0, extra = "") {
+  const ms = Math.round(performance.now() - t0);
+  console.info(`[MTApi] ${label}: ${ms} ms${extra ? ` (${extra})` : ""}`);
+}
+
 async function callAsmx(method, bodyObj) {
+  const t0 = performance.now();
   let res;
   try {
     res = await fetch(`${BASE_URL}/DataService.asmx/${method}`, {
@@ -135,6 +178,7 @@ async function callAsmx(method, bodyObj) {
   }
 
   const data = await res.json();
+  logTiming(method, t0);
   // ASMX wraps the real payload as a JSON *string* inside "d"
   if (data && typeof data.d === "string") {
     try {
@@ -397,17 +441,32 @@ function timeStringToTodayDate(timeStr) {
  * Fetches everything needed for the popup in one go.
  */
 async function fetchDashboardData(memberId) {
-  // Gate on MemberSelect — the one endpoint we know returns real JSON and
-  // fails cleanly (rather than the unverified/XML GetMemberID endpoint).
-  let memberInfo;
-  try {
-    memberInfo = await getMemberInfo(memberId);
-  } catch (err) {
+  // All three requests go out at the same time — previously MemberSelect ran
+  // first and the other two waited for it, adding a full extra round-trip.
+  // MemberSelect is still the auth gate: if it fails, the whole call fails.
+  const [memberResult, todayPunches, monthRecords] = await Promise.all([
+    getMemberInfo(memberId).then(
+      (info) => ({ info }),
+      (error) => ({ error })
+    ),
+    getTodayPunches(memberId).catch((err) => {
+      console.warn("[MTApi] InOutSelectByDateAsc failed:", err);
+      return null;
+    }),
+    getMonthRecords(memberId).catch((err) => {
+      console.warn("[MTApi] InOutSelectByMonth failed:", err);
+      return [];
+    }),
+  ]);
+
+  if (memberResult.error) {
+    const err = memberResult.error;
     console.error("[MTApi] MemberSelect failed:", err);
     const authErr = new Error("AUTH_REQUIRED");
     authErr.cause = err && err.message ? err.message : String(err);
     throw authErr;
   }
+  const memberInfo = memberResult.info;
 
   if (
     !memberInfo ||
@@ -418,17 +477,6 @@ async function fetchDashboardData(memberId) {
       "MemberSelect returned an empty/unexpected response (possibly a login redirect, or memberID mismatch)";
     throw authErr;
   }
-
-  const [todayPunches, monthRecords] = await Promise.all([
-    getTodayPunches(memberId).catch((err) => {
-      console.warn("[MTApi] InOutSelectByDateAsc failed:", err);
-      return null;
-    }),
-    getMonthRecords(memberId).catch((err) => {
-      console.warn("[MTApi] InOutSelectByMonth failed:", err);
-      return [];
-    }),
-  ]);
 
   const shiftInfo = parseShiftTime(memberInfo.shiftTimeRaw);
   const WORK_SHIFT_MINUTES = 495; // 8:15 actual working time — excludes unpaid break
@@ -541,6 +589,8 @@ self.MTApi = {
   fetchDashboardData,
   fetchBadgeData,
   detectLoggedInMemberId,
+  resolveMemberId,
+  clearCachedMemberId,
   checkSession,
   getMonthRecords,
   computeBadge,
